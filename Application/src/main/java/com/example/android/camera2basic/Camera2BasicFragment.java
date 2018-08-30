@@ -50,6 +50,7 @@ import android.support.v4.app.DialogFragment;
 import android.support.v4.app.Fragment;
 import android.support.v4.content.ContextCompat;
 import android.util.Log;
+import android.util.Range;
 import android.util.Size;
 import android.util.SparseIntArray;
 import android.view.LayoutInflater;
@@ -62,12 +63,18 @@ import android.widget.Toast;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Date;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 
@@ -219,15 +226,21 @@ public class Camera2BasicFragment extends Fragment
      */
     private HandlerThread mBackgroundThread;
 
+    private HandlerThread senderThread;
+
     /**
      * A {@link Handler} for running tasks in the background.
      */
     private Handler mBackgroundHandler;
 
+    private Handler senderHandler;
+
     /**
      * An {@link ImageReader} that handles still image capture.
      */
     private ImageReader mImageReader;
+
+    private ImageReader previewReader;
 
     /**
      * This is the output file for our picture.
@@ -246,6 +259,22 @@ public class Camera2BasicFragment extends Fragment
             mBackgroundHandler.post(new ImageSaver(reader.acquireNextImage(), mFile));
         }
 
+    };
+
+    private ImageSender imageSender;
+
+    private final ImageReader.OnImageAvailableListener previewReaderListener
+            = new ImageReader.OnImageAvailableListener() {
+        @Override
+        public void onImageAvailable(ImageReader reader) {
+            try {
+                Image image = reader.acquireLatestImage();
+                if (image == null) return;
+                senderHandler.post(imageSender.send(image));
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
     };
 
     /**
@@ -435,6 +464,8 @@ public class Camera2BasicFragment extends Fragment
     public void onActivityCreated(Bundle savedInstanceState) {
         super.onActivityCreated(savedInstanceState);
         mFile = new File(getActivity().getExternalFilesDir(null), "pic.jpg");
+            imageSender = new ImageSender(8000);
+        imageSender.start();
     }
 
     @Override
@@ -579,6 +610,14 @@ public class Camera2BasicFragment extends Fragment
                             mPreviewSize.getHeight(), mPreviewSize.getWidth());
                 }
 
+                Range<Integer>[] ranges = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+                Log.i(TAG, "ae fps ranges " + Arrays.asList(ranges).toString());
+                Log.i(TAG, "resolutions " + Arrays.asList(map.getOutputSizes(ImageFormat.JPEG)).toString());
+
+                previewReader = ImageReader.newInstance(640, 480, ImageFormat.JPEG, 2);
+                previewReader.setOnImageAvailableListener(
+                        previewReaderListener, senderHandler);
+
                 // Check if the flash is supported.
                 Boolean available = characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE);
                 mFlashSupported = available == null ? false : available;
@@ -639,6 +678,10 @@ public class Camera2BasicFragment extends Fragment
                 mImageReader.close();
                 mImageReader = null;
             }
+            if (null != previewReader) {
+                previewReader.close();
+                previewReader = null;
+            }
         } catch (InterruptedException e) {
             throw new RuntimeException("Interrupted while trying to lock camera closing.", e);
         } finally {
@@ -653,6 +696,10 @@ public class Camera2BasicFragment extends Fragment
         mBackgroundThread = new HandlerThread("CameraBackground");
         mBackgroundThread.start();
         mBackgroundHandler = new Handler(mBackgroundThread.getLooper());
+
+        senderThread = new HandlerThread("SenderBackground");
+        senderThread.start();
+        senderHandler = new Handler(senderThread.getLooper());
     }
 
     /**
@@ -664,6 +711,14 @@ public class Camera2BasicFragment extends Fragment
             mBackgroundThread.join();
             mBackgroundThread = null;
             mBackgroundHandler = null;
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+        senderThread.quitSafely();
+        try {
+            senderThread.join();
+            senderThread = null;
+            senderHandler = null;
         } catch (InterruptedException e) {
             e.printStackTrace();
         }
@@ -687,9 +742,10 @@ public class Camera2BasicFragment extends Fragment
             mPreviewRequestBuilder
                     = mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
             mPreviewRequestBuilder.addTarget(surface);
+            mPreviewRequestBuilder.addTarget(previewReader.getSurface());
 
             // Here, we create a CameraCaptureSession for camera preview.
-            mCameraDevice.createCaptureSession(Arrays.asList(surface, mImageReader.getSurface()),
+            mCameraDevice.createCaptureSession(Arrays.asList(surface, previewReader.getSurface()), //, mImageReader.getSurface()
                     new CameraCaptureSession.StateCallback() {
 
                         @Override
@@ -707,6 +763,8 @@ public class Camera2BasicFragment extends Fragment
                                         CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
                                 // Flash is automatically enabled when necessary.
                                 setAutoFlash(mPreviewRequestBuilder);
+
+                                mPreviewRequestBuilder.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON);
 
                                 // Finally, we start displaying the camera preview.
                                 mPreviewRequest = mPreviewRequestBuilder.build();
@@ -954,6 +1012,121 @@ public class Camera2BasicFragment extends Fragment
         }
 
     }
+
+    private static class ImageSender extends Thread {
+
+        private static class ClientHandler {
+            private final Socket sck;
+            private final OutputStream os;
+            private boolean toRemove;
+
+            ClientHandler(Socket sck) throws IOException {
+                this.sck = sck;
+                this.os = sck.getOutputStream();
+                this.toRemove = false;
+            }
+
+            void send(byte[] data) throws IOException {
+                os.write(data);
+            }
+
+            void close() {
+                try {
+                    toRemove = true;
+                    os.close();
+                    sck.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+
+            boolean shouldRemove() {
+                return toRemove;
+            }
+        }
+
+        private final String TAG = "SNDR";
+        private final long sendDelay = 200;
+
+        private final int port;
+        private ServerSocket srv;
+        private final Set<ClientHandler> clients;
+        private Date lastSent;
+
+        public ImageSender(int port) {
+            this.port = port;
+            this.clients = Collections.synchronizedSet(new HashSet<>());
+            this.lastSent = new Date();
+        }
+
+        public void shutdown() {
+            try {
+                Log.i(TAG, "shutting down");
+                clients.clear();
+                srv.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+
+        @Override
+        public void run() {
+            try {
+                srv = new ServerSocket(port);
+                Log.i(TAG, "started");
+                while (true) {
+                    Socket sck = srv.accept();
+                    clients.add(new ClientHandler(sck));
+                    Log.i(TAG, "new client " + sck.getInetAddress());
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+
+        public Runnable send(final Image image) {
+            return new Runnable() {
+                @Override
+                public void run() {
+                    // don't send data more often than every 200ms
+                    Date now = new Date();
+                    if (now.getTime() - lastSent.getTime() < sendDelay) {
+                        if (image != null) image.close();
+                        return;
+                    }
+
+                    try {
+                        ByteBuffer buffer = image.getPlanes()[0].getBuffer();
+                        int size = buffer.remaining();
+                        byte[] bytes = new byte[size+4];
+                        ByteBuffer sizeBuffer = ByteBuffer.allocate(4).putInt(size);
+                        sizeBuffer.flip();
+                        sizeBuffer.get(bytes, 0, 4);
+                        buffer.get(bytes, 4, size);
+
+                        if (clients.size() > 0) Log.i(TAG, "Sending " + size + "b to " + clients.size() + " clients");
+
+                        clients.stream().forEach(client -> {
+                            try {
+                                client.send(bytes);
+                            } catch (IOException e) {
+                                client.close();
+                            }
+                        });
+
+                        // remove any that closed
+                        clients.removeIf(client -> client.toRemove);
+
+                        // timer to prevent sending too often
+                        lastSent = new Date();
+                    } finally {
+                        if (image != null) image.close();
+                    }
+                }
+            };
+        }
+    }
+
 
     /**
      * Compares two {@code Size}s based on their areas.
