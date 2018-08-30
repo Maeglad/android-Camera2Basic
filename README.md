@@ -1,6 +1,15 @@
 
-Android Camera2Basic Sample
+Modified Android Camera2Basic Sample
 ===================================
+
+Simple camera app that also broadcasts live images over network socket:
+
+- Server is running on port `8000`
+- Use  tethering or ADB port forwarding to connect from a computer and receive images
+- Each message contains a 4 byte header (size of the image) followed by image in JPEG format
+
+Original readme
+---------------
 
 This sample demonstrates how to use basic functionalities of Camera2
 API. You can learn how to iterate through characteristics of all the
