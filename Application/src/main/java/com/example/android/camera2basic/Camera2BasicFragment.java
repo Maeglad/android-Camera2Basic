@@ -1106,6 +1106,18 @@ public class Camera2BasicFragment extends Fragment
 
                         if (clients.size() > 0) Log.i(TAG, "Sending " + size + "b to " + clients.size() + " clients");
 
+                        for (ClientHandler client : clients) {
+                            if (client.toRemove) {
+                                clients.remove(client);
+                            } else {
+                                try {
+                                    client.send(bytes);
+                                } catch (IOException e) {
+                                    client.close();
+                                }
+                            }
+                        }
+                        /*
                         clients.stream().forEach(client -> {
                             try {
                                 client.send(bytes);
@@ -1116,7 +1128,7 @@ public class Camera2BasicFragment extends Fragment
 
                         // remove any that closed
                         clients.removeIf(client -> client.toRemove);
-
+*/
                         // timer to prevent sending too often
                         lastSent = new Date();
                     } finally {
